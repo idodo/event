@@ -41,6 +41,10 @@ type Manager struct {
 	listeners map[string]*ListenerQueue
 	// storage all event names by listened
 	listenedNames map[string]int
+	// storage all wildcard names
+	listenedWildcardNames map[string]int
+	// storage all wildcard name and ListenerQueue map
+	wildcardListeners map[string]*ListenerQueue
 }
 
 // NewManager create event manager
@@ -50,8 +54,10 @@ func NewManager(name string) *Manager {
 		sample: &BasicEvent{},
 		events: make(map[string]Event),
 		// listeners
-		listeners:     make(map[string]*ListenerQueue),
-		listenedNames: make(map[string]int),
+		listeners:             make(map[string]*ListenerQueue),
+		listenedNames:         make(map[string]int),
+		listenedWildcardNames: make(map[string]int),
+		wildcardListeners:     make(map[string]*ListenerQueue),
 	}
 
 	return em
@@ -117,13 +123,24 @@ func (em *Manager) addListenerItem(name string, li *ListenerItem) {
 	if li.Listener == nil {
 		panic("event: the event '" + name + "' listener cannot be empty")
 	}
+	//add wildcard name
+	if name != Wildcard && strings.HasSuffix(name, "*") {
+		name = name[:len(name)-1]
+		if lq, ok := em.wildcardListeners[name]; ok {
+			lq.Push(li)
+		} else {
+			em.wildcardListeners[name] = (&ListenerQueue{}).Push(li)
+			em.listenedWildcardNames[name] = 1
+		}
 
-	// exists, append it.
-	if lq, ok := em.listeners[name]; ok {
-		lq.Push(li)
-	} else { // first add.
-		em.listenedNames[name] = 1
-		em.listeners[name] = (&ListenerQueue{}).Push(li)
+	} else {
+		// exists, append it.
+		if lq, ok := em.listeners[name]; ok {
+			lq.Push(li)
+		} else { // first add.
+			em.listenedNames[name] = 1
+			em.listeners[name] = (&ListenerQueue{}).Push(li)
+		}
 	}
 }
 
@@ -156,16 +173,19 @@ func (em *Manager) Fire(name string, params M) (err error, e Event) {
 
 	// NOTICE: must check the '*' global listeners
 	if false == em.HasListeners(name) && false == em.HasListeners(Wildcard) {
-		// has group listeners. "app.*" "app.db.*"
-		// eg: "app.db.run" will trigger listeners on the "app.db.*"
-		pos := strings.LastIndexByte(name, '.')
-		if pos < 0 || pos == len(name)-1 {
-			return // not found listeners.
-		}
-
-		groupName := name[:pos+1] + Wildcard // "app.db.*"
-		if false == em.HasListeners(groupName) {
-			return // not found listeners.
+		//// has group listeners. "app.*" "app.db.*"
+		//// eg: "app.db.run" will trigger listeners on the "app.db.*"
+		//pos := strings.LastIndexByte(name, '.')
+		//if pos < 0 || pos == len(name)-1 {
+		//	return // not found listeners.
+		//}
+		//
+		//groupName := name[:pos+1] + Wildcard // "app.db.*"
+		//if false == em.HasListeners(groupName) {
+		//	return // not found listeners.
+		//}
+		if !em.HasWildcardListeners(name) {
+			return // not found listeners
 		}
 	}
 
@@ -252,20 +272,30 @@ func (em *Manager) FireEvent(e Event) (err error) {
 
 	// has group listeners. "app.*" "app.db.*"
 	// eg: "app.run" will trigger listeners on the "app.*"
-	pos := strings.LastIndexByte(name, '.')
-	if pos > 0 && pos < len(name) {
-		groupName := name[:pos+1] + Wildcard // "app.*"
-
-		if lq, ok := em.listeners[groupName]; ok {
+	//pos := strings.LastIndexByte(name, '.')
+	//if pos > 0 && pos < len(name) {
+	//	groupName := name[:pos+1] + Wildcard // "app.*"
+	//
+	//	if lq, ok := em.listeners[groupName]; ok {
+	//		for _, li := range lq.Sort().Items() {
+	//			err = li.Listener.Handle(e)
+	//			if err != nil || e.IsAborted() {
+	//				return
+	//			}
+	//		}
+	//	}
+	//}
+	// has prefix event listeners
+	for prefix, lq := range em.wildcardListeners {
+		if strings.HasPrefix(name, prefix) {
 			for _, li := range lq.Sort().Items() {
 				err = li.Listener.Handle(e)
 				if err != nil || e.IsAborted() {
-					return
+					break
 				}
 			}
 		}
 	}
-
 	// has wildcard event listeners
 	if lq, ok := em.listeners[Wildcard]; ok {
 		for _, li := range lq.Sort().Items() {
@@ -275,6 +305,7 @@ func (em *Manager) FireEvent(e Event) (err error) {
 			}
 		}
 	}
+
 	return
 }
 
@@ -331,6 +362,15 @@ func (em *Manager) HasListeners(name string) bool {
 	return ok
 }
 
+func (em *Manager) HasWildcardListeners(name string) bool {
+	for prefix, _ := range em.listenedWildcardNames {
+		if strings.HasPrefix(name, prefix) {
+			return true
+		}
+	}
+	return false
+}
+
 // Listeners get all listeners
 func (em *Manager) Listeners() map[string]*ListenerQueue {
 	return em.listeners
@@ -362,6 +402,20 @@ func (em *Manager) ListenedNames() map[string]int {
 //	RemoveListener("name", listener) // limit event name.
 func (em *Manager) RemoveListener(name string, listener Listener) {
 	if name != "" {
+		//remove wildcard listener
+		if name != Wildcard && strings.HasSuffix(name, "*") {
+			name = name[:len(name)-1]
+			if lq, ok := em.wildcardListeners[name]; ok {
+				lq.Remove(listener)
+				// delete from manager
+				if lq.IsEmpty() {
+					delete(em.wildcardListeners, name)
+					delete(em.listenedWildcardNames, name)
+				}
+			}
+			return
+		}
+		//normal
 		if lq, ok := em.listeners[name]; ok {
 			lq.Remove(listener)
 
@@ -384,10 +438,34 @@ func (em *Manager) RemoveListener(name string, listener Listener) {
 			delete(em.listenedNames, name)
 		}
 	}
+	for name, lq := range em.wildcardListeners {
+		lq.Remove(listener)
+
+		// delete from manager
+		if lq.IsEmpty() {
+			delete(em.wildcardListeners, name)
+			delete(em.listenedWildcardNames, name)
+		}
+	}
+
 }
 
 // RemoveListeners remove listeners by given name
 func (em *Manager) RemoveListeners(name string) {
+	name = strings.TrimSpace(name)
+
+	//wildcard prefix remove
+	if name != Wildcard && strings.HasSuffix(name, "*") {
+		name = name[:len(name)-1]
+		if _, ok := em.listenedWildcardNames[name]; ok {
+			em.wildcardListeners[name].Clear()
+			delete(em.wildcardListeners, name)
+			delete(em.listenedWildcardNames, name)
+		}
+		return
+	}
+
+	// normal or * remove
 	_, ok := em.listenedNames[name]
 	if ok {
 		em.listeners[name].Clear()
@@ -415,6 +493,8 @@ func (em *Manager) Reset() {
 	em.events = make(map[string]Event)
 	em.listeners = make(map[string]*ListenerQueue)
 	em.listenedNames = make(map[string]int)
+	em.listenedWildcardNames = make(map[string]int)
+	em.wildcardListeners = make(map[string]*ListenerQueue)
 }
 
 func goodName(name string) string {
